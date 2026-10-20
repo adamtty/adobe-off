@@ -1,0 +1,257 @@
+#!/bin/bash
+# adobe -- stop Adobe Creative Cloud's background services on demand, and put them back.
+#
+# Only the background stack is touched: Photoshop, Premiere, After Effects and the other creative
+# apps are never signalled, and `off` refuses to run while one is open (unless --force), since they
+# lean on the background services for licensing and sync.
+
+set -uo pipefail
+# system tools only: nothing earlier in PATH can stand in for kill, launchctl or sudo
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+UID_=$(id -u)
+
+# Login agents (from /Library/LaunchAgents or ~/Library/LaunchAgents). Booting them out is what
+# stops them coming straight back after a kill.
+AGENTS=(
+	com.adobe.AdobeCreativeCloud
+	com.adobe.AdobeDesktopService
+	com.adobe.ccxprocess
+	com.adobe.GC.Invoker-1.0
+	com.adobe.GC.Scheduler-1.0
+)
+
+# System daemons (root). Adobe Genuine Service runs all the time. The installer helper isn't here:
+# it's launched on demand, so killing it is enough, and Creative Cloud can still install updates.
+DAEMONS=(
+	com.adobe.agsservice
+)
+
+# Finder sidebar and right-click menu extensions
+APPEX=(
+	com.adobe.accmac.ACCFinderSync
+	com.adobe.acc.anc.AdobeCreativeCloud.AdobeContextMenuExtension
+)
+
+# Where the background stack lives. A process counts as background when its executable (not its
+# arguments) is under one of these, so a file or command line that merely mentions Adobe is never hit.
+BACKGROUND_RE="^(/Library/Application Support/Adobe/|$HOME/Library/Application Support/Adobe/|/Applications/Utilities/Adobe [^/]+/|/Applications/Adobe Creative Cloud/|/Library/PrivilegedHelperTools/com\.adobe\.)"
+# The creative apps: /Applications/Adobe Photoshop 2026/Adobe Photoshop 2026.app/Contents/MacOS/...
+CREATIVE_RE="^/Applications/Adobe [^/]+/[^/]+\.app/Contents/MacOS/"
+
+usage() {
+	cat <<'EOF'
+usage: adobe [status|off|on]
+
+  status            what's running, and whether the services are disabled
+  off               stop the background services until you next log in
+  off --persist     ...and keep them off across logins and restarts, until `adobe on`
+  off --force       stop them even while a creative app is open
+  on                undo `off` (including --persist) and start Creative Cloud again
+EOF
+}
+
+# "pid uid path" for every process, path last because it can contain spaces
+procs() {
+	ps -axo pid=,uid=,comm=
+}
+
+# background processes, as "pid uid path" lines
+background() {
+	procs | while read -r pid uid path; do
+		[[ $path =~ $BACKGROUND_RE ]] && [[ ! $path =~ $CREATIVE_RE ]] && printf '%s %s %s\n' "$pid" "$uid" "$path"
+	done
+}
+
+# names of the open creative apps ("Adobe Photoshop 2026"), one per line
+creative_apps() {
+	procs | while read -r _ _ path; do
+		if [[ $path =~ $CREATIVE_RE ]] && [[ $path != "/Applications/Adobe Creative Cloud/"* ]]; then
+			path=${path#/Applications/}
+			printf '%s\n' "${path%%/*}"
+		fi
+	done | sort -u
+}
+
+# where a launchd job's plist is: the first of the given directories that has it
+plist_for() {
+	local label=$1 dir
+	shift
+	for dir in "$@"; do
+		[[ -f "$dir/$label.plist" ]] && { printf '%s\n' "$dir/$label.plist"; return 0; }
+	done
+	return 1
+}
+
+disabled_jobs() {
+	{
+		launchctl print-disabled "gui/$UID_"
+		launchctl print-disabled system
+	} 2>/dev/null | grep -E '"com\.adobe\.[^"]+" => (disabled|true)' | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' | sort -u
+}
+
+cmd_status() {
+	local bg apps dis
+	bg=$(background)
+	if [[ -n $bg ]]; then
+		echo "Adobe background processes: $(grep -c . <<<"$bg")"
+		while read -r _ uid path; do
+			path=${path%%.app/*}
+			printf '  %s%s\n' "${path##*/}" "$([[ $uid == 0 ]] && echo " (root)")"
+		done <<<"$bg"
+	else
+		echo "Adobe background processes: 0"
+	fi
+	dis=$(disabled_jobs)
+	if [[ -n $dis ]]; then
+		echo
+		echo "Disabled until \`adobe on\`:"
+		while read -r d; do printf '  %s\n' "$d"; done <<<"$dis"
+	fi
+	apps=$(creative_apps)
+	if [[ -n $apps ]]; then
+		echo
+		echo "Creative apps open (left alone):"
+		while read -r a; do printf '  %s\n' "$a"; done <<<"$apps"
+	fi
+	return 0
+}
+
+# signal background processes owned by uid $1 ("root" uses sudo); $2 is the signal
+signal_background() {
+	local want=$1 sig=$2 pids=() pid uid path
+	while read -r pid uid path; do
+		[[ -n $pid ]] || continue
+		if [[ $want == root ]]; then [[ $uid == 0 ]] || continue; else [[ $uid == "$want" ]] || continue; fi
+		pids+=("$pid")
+		echo "    $([[ $sig == KILL ]] && echo force-)stopped ${path##*/} ($pid)"
+	done < <(background)
+	[[ ${#pids[@]} -gt 0 ]] || return 0
+	if [[ $want == root ]]; then
+		sudo kill "-$sig" "${pids[@]}" 2>/dev/null
+	else
+		kill "-$sig" "${pids[@]}" 2>/dev/null
+	fi
+	return 0
+}
+
+cmd_off() {
+	local persist=0 force=0 arg apps label
+	for arg in "$@"; do
+		case $arg in
+			--persist) persist=1 ;;
+			--force) force=1 ;;
+			*) usage >&2; return 2 ;;
+		esac
+	done
+
+	apps=$(creative_apps)
+	if [[ -n $apps && $force == 0 ]]; then
+		echo "Not stopping anything: these are open and use the background services for licensing and sync:" >&2
+		while read -r a; do printf '  %s\n' "$a" >&2; done <<<"$apps"
+		echo "Quit them first, or run: adobe off --force" >&2
+		return 1
+	fi
+
+	# quit the UI first so it saves its state rather than being killed mid-write
+	if procs | grep -q "/Creative Cloud.app/Contents/MacOS/"; then
+		echo "[+] Quitting Creative Cloud..."
+		osascript -e 'quit app "Creative Cloud"' >/dev/null 2>&1
+		sleep 2
+	fi
+
+	echo "[+] Stopping login agents..."
+	for label in "${AGENTS[@]}"; do
+		[[ $persist == 1 ]] && launchctl disable "gui/$UID_/$label" 2>/dev/null
+		launchctl bootout "gui/$UID_/$label" 2>/dev/null && echo "    stopped $label"
+	done
+	[[ $persist == 1 ]] && echo "    disabled at login: ${AGENTS[*]}"
+
+	echo "[+] Disabling Finder extensions..."
+	for label in "${APPEX[@]}"; do
+		pluginkit -e ignore -i "$label" 2>/dev/null && echo "    disabled $label"
+	done
+
+	echo "[+] Stopping background processes..."
+	signal_background "$UID_" TERM
+	# Adobe Desktop Service and Creative Cloud Helper ignore SIGTERM
+	sleep 2
+	signal_background "$UID_" KILL
+
+	# root-owned: Adobe Genuine Service's daemon, the installer helper, crash handlers
+	if [[ -n $(background | awk '$2 == 0') ]] || { [[ $persist == 1 ]] && [[ -n $(daemons_present) ]]; }; then
+		echo "[+] Stopping root-owned services (needs your password)..."
+		if ! sudo -v; then
+			echo "    [!] skipped: sudo didn't get a password" >&2
+		else
+			for label in $(daemons_present); do
+				[[ $persist == 1 ]] && sudo launchctl disable "system/$label" 2>/dev/null
+				sudo launchctl bootout "system/$label" 2>/dev/null && echo "    stopped $label"
+			done
+			signal_background root KILL
+		fi
+	fi
+
+	echo
+	sleep 1
+	cmd_status
+}
+
+# the DAEMONS that are installed on this Mac
+daemons_present() {
+	local label
+	for label in "${DAEMONS[@]}"; do
+		plist_for "$label" /Library/LaunchDaemons >/dev/null && echo "$label"
+	done
+}
+
+cmd_on() {
+	local label plist
+	[[ $# -eq 0 ]] || { usage >&2; return 2; }
+
+	echo "[+] Re-enabling Finder extensions..."
+	for label in "${APPEX[@]}"; do
+		pluginkit -e use -i "$label" 2>/dev/null && echo "    enabled $label"
+	done
+
+	echo "[+] Starting login agents..."
+	for label in "${AGENTS[@]}"; do
+		launchctl enable "gui/$UID_/$label" 2>/dev/null
+		plist=$(plist_for "$label" /Library/LaunchAgents "$HOME/Library/LaunchAgents") || continue
+		launchctl bootstrap "gui/$UID_" "$plist" 2>/dev/null && echo "    started $label"
+	done
+
+	if [[ -n $(daemons_present) ]]; then
+		echo "[+] Starting system services (needs your password)..."
+		if sudo -v; then
+			for label in $(daemons_present); do
+				sudo launchctl enable "system/$label" 2>/dev/null
+				sudo launchctl bootstrap system "/Library/LaunchDaemons/$label.plist" 2>/dev/null && echo "    started $label"
+			done
+		else
+			echo "    [!] skipped: sudo didn't get a password" >&2
+		fi
+	fi
+
+	echo "[+] Launching Creative Cloud..."
+	open -a "Creative Cloud" 2>/dev/null || open -a "Adobe Creative Cloud" 2>/dev/null
+	echo "Give it a few seconds, then: adobe status"
+}
+
+main() {
+	local cmd=${1:-status}
+	[[ $# -gt 0 ]] && shift
+	case $cmd in
+		status) cmd_status ;;
+		off | stop) cmd_off "$@" ;;
+		on | start) cmd_on "$@" ;;
+		-h | --help | help) usage ;;
+		*) usage >&2; return 2 ;;
+	esac
+}
+
+# run unless sourced (the tests source it)
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+	main "$@"
+fi
